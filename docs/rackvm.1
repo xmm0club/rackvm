@@ -1,0 +1,60 @@
+.TH RACKVM 1 "August 2026" "RackVM 0.1.0" "User Commands"
+.SH NAME
+rackvm \- compact Linux/KVM virtual machine monitor
+.SH SYNOPSIS
+.B rackvm run
+.I CONFIG
+.RI [ OPTIONS ]
+.br
+.B rackvm run --kernel
+.I FILE
+.RI [ OPTIONS ]
+.br
+.B rackvm validate
+.I CONFIG
+.br
+.B rackvm verify
+.I CONFIG
+.br
+.B rackvm inspect
+.I KERNEL
+.br
+.B rackvm devirtualise
+.I CONFIG
+.B --output
+.I DIRECTORY
+.br
+.B rackvm doctor
+.SH DESCRIPTION
+RackVM boots an x86 Linux kernel and initramfs with hardware-assisted KVM execution. It provides multiple virtual CPUs, guest memory, an interrupt controller, a programmable timer, and an interactive serial console.
+.SH OPTIONS
+.TP
+.BI --kernel " FILE"
+Use FILE as the Linux bzImage.
+.TP
+.BI --initrd " FILE"
+Use FILE as the initial RAM filesystem.
+.TP
+.BI --name " NAME"
+Set the virtual machine name.
+.TP
+.BI --memory " MIB"
+Allocate between 64 and 65536 MiB of guest memory.
+.TP
+.BI --cpus " COUNT"
+Create between one and 64 virtual CPUs, subject to the host limit.
+.TP
+.BI --cmdline " TEXT"
+Set the Linux kernel command line.
+.TP
+.B --no-interactive
+Disable serial-console input.
+.SH FILES
+.TP
+.I /dev/kvm
+Linux KVM device used for virtual machine execution.
+.SH EXIT STATUS
+Zero indicates success. A nonzero value indicates invalid input, an unsupported host, or a virtual machine failure.
+.SH SEE ALSO
+.BR kvm (4),
+.BR grub-mkconfig (8)
