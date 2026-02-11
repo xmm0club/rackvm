@@ -4,6 +4,7 @@
 #include <asm/boot.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -376,16 +377,35 @@ static bool handle_io(struct rackvm_vcpu *vcpu)
     return true;
 }
 
+static int run_vcpu(struct rackvm_vcpu *vcpu)
+{
+    for (;;) {
+        vcpu->run->immediate_exit = 0;
+        if (atomic_load(&vcpu->vm->stopping)) {
+            vcpu->run->immediate_exit = 1;
+            errno = EINTR;
+            return -1;
+        }
+        if (ioctl(vcpu->fd, KVM_RUN, 0) == 0)
+            return 0;
+
+        int error = errno;
+        if (atomic_load(&vcpu->vm->stopping) || (error != EINTR && error != EAGAIN)) {
+            errno = error;
+            return -1;
+        }
+
+        if (error == EAGAIN)
+            sched_yield();
+    }
+}
+
 static void *vcpu_main(void *argument)
 {
     struct rackvm_vcpu *vcpu = argument;
     struct rackvm *vm = vcpu->vm;
     while (!atomic_load(&vm->stopping)) {
-        vcpu->run->immediate_exit = 0;
-        int result = ioctl(vcpu->fd, KVM_RUN, 0);
-        if (result < 0) {
-            if ((errno == EINTR || errno == EAGAIN) && !atomic_load(&vm->stopping))
-                continue;
+        if (run_vcpu(vcpu) < 0) {
             if (atomic_load(&vm->stopping))
                 break;
             fprintf(stderr, "RackVM: vCPU %u failed: %s\n", vcpu->id, strerror(errno));
