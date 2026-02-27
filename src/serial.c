@@ -41,11 +41,10 @@ static void queue_byte(struct rackvm *vm, uint8_t value)
     pthread_mutex_unlock(&vm->serial.lock);
 }
 
-static uint8_t serial_read(struct rackvm *vm, uint16_t offset)
+static uint8_t serial_read_locked(struct rackvm *vm, uint16_t offset)
 {
     struct rackvm_serial *serial = &vm->serial;
     uint8_t value = 0xff;
-    pthread_mutex_lock(&serial->lock);
     switch (offset) {
     case 0:
         if (serial->lcr & 0x80) {
@@ -80,19 +79,29 @@ static uint8_t serial_read(struct rackvm *vm, uint16_t offset)
         break;
     }
     refresh_irq(vm);
-    pthread_mutex_unlock(&serial->lock);
     return value;
 }
 
-static void serial_write(struct rackvm *vm, uint16_t offset, uint8_t value)
+static void write_stdout(const uint8_t *data, size_t size)
+{
+    while (size) {
+        ssize_t written = write(STDOUT_FILENO, data, size);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return;
+        data += (size_t)written;
+        size -= (size_t)written;
+    }
+}
+
+static void serial_write_locked(struct rackvm *vm, uint16_t offset, uint8_t value)
 {
     struct rackvm_serial *serial = &vm->serial;
     if (offset == 0 && !(serial->lcr & 0x80)) {
-        ssize_t ignored = write(STDOUT_FILENO, &value, 1);
-        (void)ignored;
+        write_stdout(&value, 1);
         return;
     }
-    pthread_mutex_lock(&serial->lock);
     switch (offset) {
     case 0:
         serial->divisor = (serial->divisor & 0xff00) | value;
@@ -118,7 +127,6 @@ static void serial_write(struct rackvm *vm, uint16_t offset, uint8_t value)
         break;
     }
     refresh_irq(vm);
-    pthread_mutex_unlock(&serial->lock);
 }
 
 bool rackvm_serial_io(struct rackvm_vcpu *vcpu)
@@ -128,20 +136,35 @@ bool rackvm_serial_io(struct rackvm_vcpu *vcpu)
     if (port < COM1 || port > COM1 + 7)
         return false;
     uint8_t *data = (uint8_t *)run + run->io.data_offset;
+    struct rackvm *vm = vcpu->vm;
+
+    if (run->io.direction == KVM_EXIT_IO_OUT && port == COM1 && run->io.size == 1) {
+        pthread_mutex_lock(&vm->serial.lock);
+        bool transmit = !(vm->serial.lcr & 0x80);
+        if (!transmit && run->io.count)
+            vm->serial.divisor = (uint16_t)((vm->serial.divisor & 0xff00) | data[run->io.count - 1]);
+        pthread_mutex_unlock(&vm->serial.lock);
+        if (transmit)
+            write_stdout(data, run->io.count);
+        return true;
+    }
+
+    pthread_mutex_lock(&vm->serial.lock);
     for (uint32_t index = 0; index < run->io.count; index++) {
         uint8_t *item = data + (size_t)index * run->io.size;
         if (run->io.direction == KVM_EXIT_IO_OUT) {
             uint64_t value = 0;
             memcpy(&value, item, run->io.size);
             for (uint8_t byte = 0; byte < run->io.size; byte++)
-                serial_write(vcpu->vm, port + byte, (value >> (byte * 8)) & 0xff);
+                serial_write_locked(vm, port + byte, (value >> (byte * 8)) & 0xff);
         } else {
             uint64_t value = 0;
             for (uint8_t byte = 0; byte < run->io.size; byte++)
-                value |= (uint64_t)serial_read(vcpu->vm, port + byte) << (byte * 8);
+                value |= (uint64_t)serial_read_locked(vm, port + byte) << (byte * 8);
             memcpy(item, &value, run->io.size);
         }
     }
+    pthread_mutex_unlock(&vm->serial.lock);
     return true;
 }
 
