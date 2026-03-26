@@ -9,14 +9,76 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int join_path(char output[RACKVM_PATH_MAX], const char *directory, const char *name, char *error, size_t error_size)
+static int open_directory_path(const char *path, char *error, size_t error_size)
 {
-    int length = snprintf(output, RACKVM_PATH_MAX, "%s/%s", directory, name);
-    if (length < 0 || length >= RACKVM_PATH_MAX) {
-        rackvm_set_error(error, error_size, "Output path is too long");
+    int directory = open(path[0] == '/' ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) {
+        rackvm_set_error(error, error_size, "%s: %s", path, strerror(errno));
         return -1;
     }
-    return 0;
+    char copy[RACKVM_PATH_MAX];
+    if (snprintf(copy, sizeof(copy), "%s", path) >= (int)sizeof(copy)) {
+        rackvm_set_error(error, error_size, "Output path is too long");
+        close(directory);
+        return -1;
+    }
+    char *position = copy;
+    char *component;
+    while ((component = strsep(&position, "/")) != NULL) {
+        if (!component[0] || !strcmp(component, "."))
+            continue;
+        int next = openat(directory, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (next < 0) {
+            rackvm_set_error(error, error_size, "%s: cannot use output path component '%s': %s", path, component, strerror(errno));
+            close(directory);
+            return -1;
+        }
+        close(directory);
+        directory = next;
+    }
+    return directory;
+}
+
+static int create_output_directory(const char *path, char *error, size_t error_size)
+{
+    char copy[RACKVM_PATH_MAX];
+    int length = snprintf(copy, sizeof(copy), "%s", path);
+    if (length <= 0 || length >= (int)sizeof(copy)) {
+        rackvm_set_error(error, error_size, "Output path is empty or too long");
+        return -1;
+    }
+    while (length > 1 && copy[length - 1] == '/')
+        copy[--length] = '\0';
+    char *slash = strrchr(copy, '/');
+    char *name = slash ? slash + 1 : copy;
+    if (!name[0] || !strcmp(name, ".") || !strcmp(name, "..")) {
+        rackvm_set_error(error, error_size, "%s: invalid output directory", path);
+        return -1;
+    }
+    const char *parent = ".";
+    if (slash) {
+        if (slash == copy)
+            parent = "/";
+        else {
+            *slash = '\0';
+            parent = copy;
+        }
+    }
+    int parent_fd = open_directory_path(parent, error, error_size);
+    if (parent_fd < 0)
+        return -1;
+    if (mkdirat(parent_fd, name, 0755) < 0) {
+        rackvm_set_error(error, error_size, "%s: %s", path, strerror(errno));
+        close(parent_fd);
+        return -1;
+    }
+    int output_fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (output_fd < 0) {
+        rackvm_set_error(error, error_size, "%s: %s", path, strerror(errno));
+        unlinkat(parent_fd, name, AT_REMOVEDIR);
+    }
+    close(parent_fd);
+    return output_fd;
 }
 
 static void json_string(FILE *file, const char *value)
@@ -56,24 +118,76 @@ static void json_string(FILE *file, const char *value)
     fputc('"', file);
 }
 
-static FILE *create_text_file(const char *path, mode_t mode, char *error, size_t error_size)
+static int copy_file_at(const char *source, int directory, const char *name, mode_t mode, char *error, size_t error_size)
 {
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode);
+    int input = open(source, O_RDONLY | O_CLOEXEC);
+    if (input < 0) {
+        rackvm_set_error(error, error_size, "%s: %s", source, strerror(errno));
+        return -1;
+    }
+    int output = openat(directory, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode);
+    if (output < 0) {
+        rackvm_set_error(error, error_size, "%s: %s", name, strerror(errno));
+        close(input);
+        return -1;
+    }
+    uint8_t buffer[65536];
+    int status = 0;
+    for (;;) {
+        ssize_t count = read(input, buffer, sizeof(buffer));
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0) {
+            if (count < 0) {
+                rackvm_set_error(error, error_size, "%s: %s", source, strerror(errno));
+                status = -1;
+            }
+            break;
+        }
+        size_t written = 0;
+        while (written < (size_t)count) {
+            ssize_t result = write(output, buffer + written, (size_t)count - written);
+            if (result < 0 && errno == EINTR)
+                continue;
+            if (result <= 0) {
+                rackvm_set_error(error, error_size, "%s: %s", name, strerror(errno));
+                status = -1;
+                break;
+            }
+            written += (size_t)result;
+        }
+        if (status < 0)
+            break;
+    }
+    if (status == 0 && fsync(output) < 0) {
+        rackvm_set_error(error, error_size, "%s: %s", name, strerror(errno));
+        status = -1;
+    }
+    close(input);
+    close(output);
+    if (status < 0)
+        unlinkat(directory, name, 0);
+    return status;
+}
+
+static FILE *create_text_file(int directory, const char *name, mode_t mode, char *error, size_t error_size)
+{
+    int fd = openat(directory, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode);
     if (fd < 0) {
-        rackvm_set_error(error, error_size, "%s: %s", path, strerror(errno));
+        rackvm_set_error(error, error_size, "%s: %s", name, strerror(errno));
         return NULL;
     }
     FILE *file = fdopen(fd, "w");
     if (!file) {
-        rackvm_set_error(error, error_size, "%s: %s", path, strerror(errno));
+        rackvm_set_error(error, error_size, "%s: %s", name, strerror(errno));
         close(fd);
-        unlink(path);
+        unlinkat(directory, name, 0);
         return NULL;
     }
     return file;
 }
 
-static int finish_text_file(FILE *file, const char *path, char *error, size_t error_size)
+static int finish_text_file(FILE *file, int directory, const char *name, char *error, size_t error_size)
 {
     int failure = 0;
     int saved_errno = 0;
@@ -90,8 +204,8 @@ static int finish_text_file(FILE *file, const char *path, char *error, size_t er
         saved_errno = errno;
     }
     if (failure) {
-        rackvm_set_error(error, error_size, "%s: %s", path, strerror(saved_errno));
-        unlink(path);
+        rackvm_set_error(error, error_size, "%s: %s", name, strerror(saved_errno));
+        unlinkat(directory, name, 0);
         return -1;
     }
     return 0;
@@ -119,50 +233,34 @@ static void write_grub_cmdline(FILE *file, const char *cmdline)
     }
 }
 
-static void cleanup_bundle(const char *output, const char *kernel, const char *initrd, const char *grub, const char *manifest, const char *checksums)
+static void cleanup_bundle(const char *output, int directory)
 {
-    if (*checksums)
-        unlink(checksums);
-    if (*manifest)
-        unlink(manifest);
-    if (*grub)
-        unlink(grub);
-    if (*initrd)
-        unlink(initrd);
-    if (*kernel)
-        unlink(kernel);
+    unlinkat(directory, "SHA256SUMS", 0);
+    unlinkat(directory, "manifest.json", 0);
+    unlinkat(directory, "grub.cfg", 0);
+    unlinkat(directory, "initramfs", 0);
+    unlinkat(directory, "vmlinuz", 0);
+    close(directory);
     rmdir(output);
 }
 
 int rackvm_devirtualise(const struct rackvm_config *config, const char *output)
 {
     char error[512] = {0};
-    if (rackvm_mkdir(output, 0755, error, sizeof(error)) < 0) {
+    int output_fd = create_output_directory(output, error, sizeof(error));
+    if (output_fd < 0) {
         fprintf(stderr, "RackVM: %s\n", error);
         return 1;
     }
-    char kernel_path[RACKVM_PATH_MAX] = {0};
-    char initrd_path[RACKVM_PATH_MAX] = {0};
-    char grub_path[RACKVM_PATH_MAX] = {0};
-    char manifest_path[RACKVM_PATH_MAX] = {0};
-    char checksums_path[RACKVM_PATH_MAX] = {0};
-    if (join_path(kernel_path, output, "vmlinuz", error, sizeof(error)) < 0 ||
-        join_path(initrd_path, output, "initramfs", error, sizeof(error)) < 0 ||
-        join_path(grub_path, output, "grub.cfg", error, sizeof(error)) < 0 ||
-        join_path(manifest_path, output, "manifest.json", error, sizeof(error)) < 0 ||
-        join_path(checksums_path, output, "SHA256SUMS", error, sizeof(error)) < 0) {
+    if (copy_file_at(config->kernel, output_fd, "vmlinuz", 0644, error, sizeof(error)) < 0) {
         fprintf(stderr, "RackVM: %s\n", error);
         goto failure;
     }
-    if (rackvm_copy_file(config->kernel, kernel_path, 0644, error, sizeof(error)) < 0) {
+    if (config->initrd[0] && copy_file_at(config->initrd, output_fd, "initramfs", 0644, error, sizeof(error)) < 0) {
         fprintf(stderr, "RackVM: %s\n", error);
         goto failure;
     }
-    if (config->initrd[0] && rackvm_copy_file(config->initrd, initrd_path, 0644, error, sizeof(error)) < 0) {
-        fprintf(stderr, "RackVM: %s\n", error);
-        goto failure;
-    }
-    FILE *grub = create_text_file(grub_path, 0644, error, sizeof(error));
+    FILE *grub = create_text_file(output_fd, "grub.cfg", 0644, error, sizeof(error));
     if (!grub) {
         fprintf(stderr, "RackVM: %s\n", error);
         goto failure;
@@ -175,25 +273,25 @@ int rackvm_devirtualise(const struct rackvm_config *config, const char *output)
     if (config->initrd[0])
         fputs("    initrd /rackvm/initramfs\n", grub);
     fputs("}\n", grub);
-    if (finish_text_file(grub, grub_path, error, sizeof(error)) < 0) {
+    if (finish_text_file(grub, output_fd, "grub.cfg", error, sizeof(error)) < 0) {
         fprintf(stderr, "RackVM: %s\n", error);
         goto failure;
     }
     char kernel_hash[65];
     char initrd_hash[65] = {0};
-    rackvm_sha256_file(kernel_path, kernel_hash, error, sizeof(error));
+    rackvm_sha256_file_at(output_fd, "vmlinuz", kernel_hash, error, sizeof(error));
     if (!kernel_hash[0]) {
         fprintf(stderr, "RackVM: %s\n", error);
         goto failure;
     }
     if (config->initrd[0]) {
-        rackvm_sha256_file(initrd_path, initrd_hash, error, sizeof(error));
+        rackvm_sha256_file_at(output_fd, "initramfs", initrd_hash, error, sizeof(error));
         if (!initrd_hash[0]) {
             fprintf(stderr, "RackVM: %s\n", error);
             goto failure;
         }
     }
-    FILE *manifest = create_text_file(manifest_path, 0644, error, sizeof(error));
+    FILE *manifest = create_text_file(output_fd, "manifest.json", 0644, error, sizeof(error));
     if (!manifest) {
         fprintf(stderr, "RackVM: %s\n", error);
         goto failure;
@@ -206,11 +304,11 @@ int rackvm_devirtualise(const struct rackvm_config *config, const char *output)
     if (config->initrd[0])
         fprintf(manifest, ",\n  \"initramfs\": {\"path\": \"initramfs\", \"sha256\": \"%s\"}", initrd_hash);
     fputs("\n}\n", manifest);
-    if (finish_text_file(manifest, manifest_path, error, sizeof(error)) < 0) {
+    if (finish_text_file(manifest, output_fd, "manifest.json", error, sizeof(error)) < 0) {
         fprintf(stderr, "RackVM: %s\n", error);
         goto failure;
     }
-    FILE *checksums = create_text_file(checksums_path, 0644, error, sizeof(error));
+    FILE *checksums = create_text_file(output_fd, "SHA256SUMS", 0644, error, sizeof(error));
     if (!checksums) {
         fprintf(stderr, "RackVM: %s\n", error);
         goto failure;
@@ -218,15 +316,20 @@ int rackvm_devirtualise(const struct rackvm_config *config, const char *output)
     fprintf(checksums, "%s  vmlinuz\n", kernel_hash);
     if (config->initrd[0])
         fprintf(checksums, "%s  initramfs\n", initrd_hash);
-    if (finish_text_file(checksums, checksums_path, error, sizeof(error)) < 0) {
+    if (finish_text_file(checksums, output_fd, "SHA256SUMS", error, sizeof(error)) < 0) {
         fprintf(stderr, "RackVM: %s\n", error);
         goto failure;
     }
+    if (fsync(output_fd) < 0) {
+        fprintf(stderr, "RackVM: %s: %s\n", output, strerror(errno));
+        goto failure;
+    }
+    close(output_fd);
     printf("Bare-metal bundle created at %s\n", output);
     printf("Copy its contents to /rackvm on a GRUB-bootable system.\n");
     return 0;
 
 failure:
-    cleanup_bundle(output, kernel_path, initrd_path, grub_path, manifest_path, checksums_path);
+    cleanup_bundle(output, output_fd);
     return 1;
 }

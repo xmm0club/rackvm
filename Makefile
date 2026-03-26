@@ -1,7 +1,6 @@
 CC ?= cc
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
-MANDIR ?= $(PREFIX)/share/man
 CFLAGS ?= -O2 -g
 CPPFLAGS += -Iinclude
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wstrict-prototypes -fstack-protector-strong
@@ -30,12 +29,11 @@ demo-initramfs:
 	./tools/mkinitramfs.sh examples/assets/initramfs
 
 install: $(TARGET)
-	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(MANDIR)/man1
+	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(TARGET) $(DESTDIR)$(BINDIR)/rackvm
-	install -m 0644 docs/rackvm.1 $(DESTDIR)$(MANDIR)/man1/rackvm.1
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/rackvm $(DESTDIR)$(MANDIR)/man1/rackvm.1
+	rm -f $(DESTDIR)$(BINDIR)/rackvm
 
 clean:
 	rm -rf build

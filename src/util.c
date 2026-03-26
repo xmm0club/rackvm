@@ -237,14 +237,9 @@ const char *rackvm_basename(const char *path)
     return slash ? slash + 1 : path;
 }
 
-void rackvm_sha256_file(const char *path, char output[65], char *error, size_t error_size)
+static void sha256_fd(int fd, const char *name, char output[65], char *error, size_t error_size)
 {
     output[0] = '\0';
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        rackvm_set_error(error, error_size, "%s: %s", path, strerror(errno));
-        return;
-    }
     struct sha256_context context;
     sha256_init(&context);
     uint8_t buffer[65536];
@@ -253,17 +248,39 @@ void rackvm_sha256_file(const char *path, char output[65], char *error, size_t e
         if (count < 0 && errno == EINTR)
             continue;
         if (count < 0) {
-            rackvm_set_error(error, error_size, "%s: %s", path, strerror(errno));
-            close(fd);
+            rackvm_set_error(error, error_size, "%s: %s", name, strerror(errno));
             return;
         }
         if (!count)
             break;
         sha256_update(&context, buffer, (size_t)count);
     }
-    close(fd);
     uint8_t digest[32];
     sha256_finish(&context, digest);
     for (size_t i = 0; i < sizeof(digest); i++)
         snprintf(output + i * 2, 3, "%02x", digest[i]);
+}
+
+void rackvm_sha256_file(const char *path, char output[65], char *error, size_t error_size)
+{
+    output[0] = '\0';
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        rackvm_set_error(error, error_size, "%s: %s", path, strerror(errno));
+        return;
+    }
+    sha256_fd(fd, path, output, error, error_size);
+    close(fd);
+}
+
+void rackvm_sha256_file_at(int directory, const char *name, char output[65], char *error, size_t error_size)
+{
+    output[0] = '\0';
+    int fd = openat(directory, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        rackvm_set_error(error, error_size, "%s: %s", name, strerror(errno));
+        return;
+    }
+    sha256_fd(fd, name, output, error, error_size);
+    close(fd);
 }

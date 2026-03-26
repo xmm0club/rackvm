@@ -92,6 +92,7 @@ int rackvm_copy_file(const char *source, const char *destination, mode_t mode, c
 int rackvm_mkdir(const char *path, mode_t mode, char *error, size_t error_size);
 const char *rackvm_basename(const char *path);
 void rackvm_sha256_file(const char *path, char output[65], char *error, size_t error_size);
+void rackvm_sha256_file_at(int directory, const char *name, char output[65], char *error, size_t error_size);
 void rackvm_set_error(char *buffer, size_t size, const char *format, ...);
 
 #endif

@@ -64,6 +64,11 @@ printf '\007\000\000\000' | dd of="$temporary/constrained-vmlinuz" bs=1 seek=556
 sed "s|$temporary/vmlinuz|$temporary/constrained-vmlinuz|" "$temporary/rackvm.conf" > "$temporary/oversized-initrd.conf"
 expect_failure 'Initramfs does not fit in guest memory' "$rackvm" verify "$temporary/oversized-initrd.conf"
 
+mkdir "$temporary/real-output"
+ln -s "$temporary/real-output" "$temporary/linked-output"
+expect_failure "cannot use output path component 'linked-output'" "$rackvm" devirtualise "$temporary/rackvm.conf" --output "$temporary/linked-output/bundle"
+test ! -e "$temporary/real-output/bundle"
+
 "$rackvm" devirtualise "$temporary/rackvm.conf" --output "$temporary/bare-metal" | grep -q 'Bare-metal bundle created'
 test -s "$temporary/bare-metal/vmlinuz"
 test -s "$temporary/bare-metal/initramfs"
