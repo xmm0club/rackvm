@@ -8,11 +8,13 @@
 #include <linux/virtio_config.h>
 #include <linux/virtio_mmio.h>
 #include <linux/virtio_ring.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 
 #define VIRTIO_MMIO_BASE 0xd0000000ULL
@@ -32,7 +34,15 @@ struct rackvm_virtio_queue {
 
 struct rackvm_virtio_blk {
     int disk_fd;
+    int notify_fd;
+    int irq_fd;
+    int resample_fd;
     pthread_mutex_t lock;
+    pthread_t worker;
+    atomic_bool worker_stopping;
+    bool worker_started;
+    bool accelerated;
+    struct rackvm *vm;
     uint64_t capacity;
     uint32_t device_features_select;
     uint32_t driver_features_select;
@@ -56,11 +66,22 @@ static void *guest_pointer(struct rackvm *vm, uint64_t address, size_t size)
     return (uint8_t *)vm->memory + address;
 }
 
-static void set_irq(struct rackvm *vm, bool level)
+static void set_irq_line(struct rackvm *vm, bool level)
 {
     struct kvm_irq_level irq = {.irq = VIRTIO_BLOCK_IRQ, .level = level ? 1U : 0U};
     if (vm->vm_fd >= 0)
         ioctl(vm->vm_fd, KVM_IRQ_LINE, &irq);
+}
+
+static void raise_irq(struct rackvm *vm)
+{
+    if (vm->block->accelerated) {
+        uint64_t value = 1;
+        if (write(vm->block->irq_fd, &value, sizeof(value)) < 0 && errno != EAGAIN)
+            atomic_store(&vm->exit_status, 1);
+    } else {
+        set_irq_line(vm, true);
+    }
 }
 
 static int read_descriptor(struct rackvm *vm, uint16_t index, struct vring_desc *descriptor)
@@ -181,7 +202,7 @@ static void process_queue(struct rackvm *vm)
     if (!processed || queue->last_available != published)
         return;
     vm->block->interrupt_status |= VIRTIO_MMIO_INT_VRING;
-    set_irq(vm, true);
+    raise_irq(vm);
 }
 
 static uint32_t read_register(struct rackvm *vm, uint64_t offset)
@@ -269,8 +290,8 @@ static void write_register(struct rackvm *vm, uint64_t offset, uint32_t value)
         break;
     case VIRTIO_MMIO_INTERRUPT_ACK:
         block->interrupt_status &= ~value;
-        if (!block->interrupt_status)
-            set_irq(vm, false);
+        if (!block->interrupt_status && !block->accelerated)
+            set_irq_line(vm, false);
         break;
     case VIRTIO_MMIO_STATUS:
         if (value == 0)
@@ -293,6 +314,102 @@ static void write_register(struct rackvm *vm, uint64_t offset, uint32_t value)
     }
 }
 
+static void *queue_worker(void *argument)
+{
+    struct rackvm_virtio_blk *block = argument;
+    struct pollfd events[2] = {
+        {.fd = block->notify_fd, .events = POLLIN},
+        {.fd = block->resample_fd, .events = POLLIN}
+    };
+    while (!atomic_load(&block->worker_stopping)) {
+        int ready = poll(events, 2, -1);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready < 0)
+            break;
+        if (events[0].revents & POLLIN) {
+            uint64_t value;
+            if (read(block->notify_fd, &value, sizeof(value)) == (ssize_t)sizeof(value) && !atomic_load(&block->worker_stopping)) {
+                pthread_mutex_lock(&block->lock);
+                process_queue(block->vm);
+                pthread_mutex_unlock(&block->lock);
+            }
+        }
+        if (events[1].revents & POLLIN) {
+            uint64_t value;
+            if (read(block->resample_fd, &value, sizeof(value)) == (ssize_t)sizeof(value)) {
+                pthread_mutex_lock(&block->lock);
+                if (block->interrupt_status)
+                    raise_irq(block->vm);
+                pthread_mutex_unlock(&block->lock);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void unregister_acceleration(struct rackvm *vm)
+{
+    struct rackvm_virtio_blk *block = vm->block;
+    if (!block || !block->accelerated)
+        return;
+    struct kvm_ioeventfd ioevent = {
+        .datamatch = 0,
+        .addr = VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NOTIFY,
+        .len = sizeof(uint32_t),
+        .fd = block->notify_fd,
+        .flags = KVM_IOEVENTFD_FLAG_DATAMATCH | KVM_IOEVENTFD_FLAG_DEASSIGN
+    };
+    ioctl(vm->vm_fd, KVM_IOEVENTFD, &ioevent);
+    struct kvm_irqfd irqfd = {
+        .fd = (uint32_t)block->irq_fd,
+        .gsi = VIRTIO_BLOCK_IRQ,
+        .flags = KVM_IRQFD_FLAG_DEASSIGN
+    };
+    ioctl(vm->vm_fd, KVM_IRQFD, &irqfd);
+    block->accelerated = false;
+}
+
+static void setup_acceleration(struct rackvm *vm)
+{
+    struct rackvm_virtio_blk *block = vm->block;
+    if (ioctl(vm->kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_IOEVENTFD) <= 0 ||
+        ioctl(vm->kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_IRQFD) <= 0 ||
+        ioctl(vm->kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_IRQFD_RESAMPLE) <= 0)
+        return;
+    block->notify_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    block->irq_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    block->resample_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (block->notify_fd < 0 || block->irq_fd < 0 || block->resample_fd < 0)
+        return;
+    struct kvm_ioeventfd ioevent = {
+        .datamatch = 0,
+        .addr = VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NOTIFY,
+        .len = sizeof(uint32_t),
+        .fd = block->notify_fd,
+        .flags = KVM_IOEVENTFD_FLAG_DATAMATCH
+    };
+    if (ioctl(vm->vm_fd, KVM_IOEVENTFD, &ioevent) < 0)
+        return;
+    struct kvm_irqfd irqfd = {
+        .fd = (uint32_t)block->irq_fd,
+        .gsi = VIRTIO_BLOCK_IRQ,
+        .flags = KVM_IRQFD_FLAG_RESAMPLE,
+        .resamplefd = (uint32_t)block->resample_fd
+    };
+    if (ioctl(vm->vm_fd, KVM_IRQFD, &irqfd) < 0) {
+        ioevent.flags |= KVM_IOEVENTFD_FLAG_DEASSIGN;
+        ioctl(vm->vm_fd, KVM_IOEVENTFD, &ioevent);
+        return;
+    }
+    block->accelerated = true;
+    if (pthread_create(&block->worker, NULL, queue_worker, block) != 0) {
+        unregister_acceleration(vm);
+        return;
+    }
+    block->worker_started = true;
+}
+
 int rackvm_virtio_blk_init(struct rackvm *vm, char *error, size_t error_size)
 {
     if (!vm->config.disk[0])
@@ -302,6 +419,12 @@ int rackvm_virtio_blk_init(struct rackvm *vm, char *error, size_t error_size)
         rackvm_set_error(error, error_size, "Cannot allocate virtio block state");
         return -1;
     }
+    block->disk_fd = -1;
+    block->notify_fd = -1;
+    block->irq_fd = -1;
+    block->resample_fd = -1;
+    block->vm = vm;
+    atomic_init(&block->worker_stopping, false);
     block->disk_fd = open(vm->config.disk, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
     if (block->disk_fd < 0) {
         rackvm_set_error(error, error_size, "%s: %s", vm->config.disk, strerror(errno));
@@ -323,6 +446,7 @@ int rackvm_virtio_blk_init(struct rackvm *vm, char *error, size_t error_size)
         return -1;
     }
     vm->block = block;
+    setup_acceleration(vm);
     return 0;
 }
 
@@ -330,6 +454,21 @@ void rackvm_virtio_blk_destroy(struct rackvm *vm)
 {
     if (!vm->block)
         return;
+    if (vm->block->worker_started) {
+        atomic_store(&vm->block->worker_stopping, true);
+        uint64_t wake = 1;
+        if (write(vm->block->notify_fd, &wake, sizeof(wake)) < 0 && errno != EAGAIN)
+            atomic_store(&vm->exit_status, 1);
+        pthread_join(vm->block->worker, NULL);
+        vm->block->worker_started = false;
+    }
+    unregister_acceleration(vm);
+    if (vm->block->notify_fd >= 0)
+        close(vm->block->notify_fd);
+    if (vm->block->irq_fd >= 0)
+        close(vm->block->irq_fd);
+    if (vm->block->resample_fd >= 0)
+        close(vm->block->resample_fd);
     if (vm->block->disk_fd >= 0)
         close(vm->block->disk_fd);
     pthread_mutex_destroy(&vm->block->lock);

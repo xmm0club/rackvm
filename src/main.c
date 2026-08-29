@@ -224,12 +224,16 @@ int rackvm_doctor(void)
     int memory = ioctl(fd, KVM_CHECK_EXTENSION, KVM_CAP_USER_MEMORY);
     int irqchip = ioctl(fd, KVM_CHECK_EXTENSION, KVM_CAP_IRQCHIP);
     int pit = ioctl(fd, KVM_CHECK_EXTENSION, KVM_CAP_PIT2);
+    int irqfd = ioctl(fd, KVM_CHECK_EXTENSION, KVM_CAP_IRQFD);
+    int ioeventfd = ioctl(fd, KVM_CHECK_EXTENSION, KVM_CAP_IOEVENTFD);
     int maximum = ioctl(fd, KVM_CHECK_EXTENSION, KVM_CAP_MAX_VCPUS);
     printf("  KVM device:    %-12s Ready\n", "/dev/kvm");
     printf("  KVM API:       %-12d %s\n", api, api == KVM_API_VERSION ? "Ready" : "Unsupported");
     printf("  Guest memory:  %-12s %s\n", memory > 0 ? "Supported" : "Missing", memory > 0 ? "Ready" : "Unsupported");
     printf("  IRQ chip:      %-12s %s\n", irqchip > 0 ? "Supported" : "Missing", irqchip > 0 ? "Ready" : "Unsupported");
     printf("  PIT2:          %-12s %s\n", pit > 0 ? "Supported" : "Missing", pit > 0 ? "Ready" : "Unsupported");
+    printf("  IRQFD:         %-12s %s\n", irqfd > 0 ? "Supported" : "Missing", irqfd > 0 ? "Accelerated" : "MMIO fallback");
+    printf("  IOEVENTFD:     %-12s %s\n", ioeventfd > 0 ? "Supported" : "Missing", ioeventfd > 0 ? "Accelerated" : "MMIO fallback");
     printf("  Maximum vCPUs: %d\n", maximum);
     close(fd);
     bool ready = architecture_ok && api == KVM_API_VERSION && memory > 0 && irqchip > 0 && pit > 0;
