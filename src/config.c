@@ -143,6 +143,11 @@ int rackvm_config_load(const char *path, struct rackvm_config *config, char *err
                 status = -1;
             else
                 snprintf(config->initrd, sizeof(config->initrd), "%s", decoded);
+        } else if (!strcmp(key, "disk")) {
+            if (strlen(decoded) >= sizeof(config->disk))
+                status = -1;
+            else
+                snprintf(config->disk, sizeof(config->disk), "%s", decoded);
         } else if (!strcmp(key, "cmdline")) {
             if (strlen(decoded) >= sizeof(config->cmdline))
                 status = -1;
@@ -202,7 +207,9 @@ int rackvm_config_resolve_paths(struct rackvm_config *config, const char *config
     *slash = '\0';
     if (resolve_one(config->kernel, absolute, error, error_size) < 0)
         return -1;
-    return resolve_one(config->initrd, absolute, error, error_size);
+    if (resolve_one(config->initrd, absolute, error, error_size) < 0)
+        return -1;
+    return resolve_one(config->disk, absolute, error, error_size);
 }
 
 int rackvm_config_validate(const struct rackvm_config *config, char *error, size_t error_size)
@@ -227,6 +234,10 @@ int rackvm_config_validate(const struct rackvm_config *config, char *error, size
     }
     if (config->initrd[0] && access(config->initrd, R_OK) < 0) {
         rackvm_set_error(error, error_size, "%s: %s", config->initrd, strerror(errno));
+        return -1;
+    }
+    if (config->disk[0] && access(config->disk, R_OK | W_OK) < 0) {
+        rackvm_set_error(error, error_size, "%s: %s", config->disk, strerror(errno));
         return -1;
     }
     if (config->memory_mib < 64 || config->memory_mib > 65536) {

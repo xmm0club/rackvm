@@ -304,7 +304,16 @@ static int load_guest(struct rackvm *vm, char *error, size_t error_size)
     parameters->screen_info.orig_video_mode = 3;
     parameters->screen_info.orig_video_isVGA = VIDEO_TYPE_VGAC;
     parameters->screen_info.orig_video_points = 16;
-    size_t cmdline_length = strlen(vm->config.cmdline) + 1;
+    char command_line[RACKVM_CMDLINE_MAX];
+    int command_length = snprintf(command_line, sizeof(command_line), "%s%s%s", vm->config.cmdline,
+        vm->config.disk[0] && vm->config.cmdline[0] ? " " : "",
+        vm->config.disk[0] ? "virtio_mmio.device=4K@0xd0000000:5" : "");
+    if (command_length < 0 || (size_t)command_length >= sizeof(command_line)) {
+        rackvm_set_error(error, error_size, "kernel command line is too long for virtio discovery");
+        free(kernel);
+        return -1;
+    }
+    size_t cmdline_length = (size_t)command_length + 1;
     if (header.cmdline_size && cmdline_length > header.cmdline_size) {
         rackvm_set_error(error, error_size, "Kernel command line exceeds the image's %u-byte limit", header.cmdline_size);
         free(kernel);
@@ -315,7 +324,7 @@ static int load_guest(struct rackvm *vm, char *error, size_t error_size)
         free(kernel);
         return -1;
     }
-    memcpy((uint8_t *)vm->memory + COMMAND_LINE_ADDRESS, vm->config.cmdline, cmdline_length);
+    memcpy((uint8_t *)vm->memory + COMMAND_LINE_ADDRESS, command_line, cmdline_length);
     parameters->e820_entries = 3;
     parameters->e820_table[0] = (struct boot_e820_entry){.addr = 0, .size = MP_CONFIG_ADDRESS, .type = E820_RAM};
     parameters->e820_table[1] = (struct boot_e820_entry){.addr = MP_CONFIG_ADDRESS, .size = 0x68000, .type = E820_RESERVED};
@@ -417,7 +426,7 @@ static void *vcpu_main(void *argument)
             handle_io(vcpu);
             break;
         case KVM_EXIT_MMIO:
-            if (!vcpu->run->mmio.is_write)
+            if (!rackvm_virtio_blk_mmio(vcpu) && !vcpu->run->mmio.is_write)
                 memset(vcpu->run->mmio.data, 0xff, vcpu->run->mmio.len);
             break;
         case KVM_EXIT_HLT:
@@ -451,6 +460,7 @@ static void destroy_vm(struct rackvm *vm)
 {
     stop_vm(vm, atomic_load(&vm->exit_status));
     rackvm_serial_destroy(vm);
+    rackvm_virtio_blk_destroy(vm);
     if (vm->vcpus) {
         for (unsigned int i = 0; i < vm->vcpu_count; i++) {
             if (vm->vcpus[i].run)
@@ -522,6 +532,8 @@ static int initialize_vm(struct rackvm *vm, char *error, size_t error_size)
         rackvm_set_error(error, error_size, "KVM_SET_USER_MEMORY_REGION: %s", strerror(errno));
         return -1;
     }
+    if (rackvm_virtio_blk_init(vm, error, error_size) < 0)
+        return -1;
     vm->vcpu_count = vm->config.cpus;
     vm->vcpus = calloc(vm->vcpu_count, sizeof(*vm->vcpus));
     if (!vm->vcpus) {
@@ -658,6 +670,7 @@ int rackvm_guest_verify(const struct rackvm_config *config)
     printf("  vCPUs:      %u\n", config->cpus);
     printf("  Kernel:     Linux x86 boot protocol\n");
     printf("  Initramfs:  %s\n", config->initrd[0] ? "Loaded and placed" : "Not configured");
+    printf("  Disk:       %s\n", config->disk[0] ? "Virtio MMIO block device" : "Not configured");
     printf("  SMP table:  Generated\n");
     return 0;
 }

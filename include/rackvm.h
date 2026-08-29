@@ -22,6 +22,7 @@ struct rackvm_config {
     char name[RACKVM_NAME_MAX];
     char kernel[RACKVM_PATH_MAX];
     char initrd[RACKVM_PATH_MAX];
+    char disk[RACKVM_PATH_MAX];
     char cmdline[RACKVM_CMDLINE_MAX];
     uint64_t memory_mib;
     unsigned int cpus;
@@ -42,6 +43,7 @@ struct rackvm_serial {
 };
 
 struct rackvm;
+struct rackvm_virtio_blk;
 
 struct rackvm_vcpu {
     struct rackvm *vm;
@@ -62,6 +64,7 @@ struct rackvm {
     struct rackvm_vcpu *vcpus;
     unsigned int vcpu_count;
     struct rackvm_serial serial;
+    struct rackvm_virtio_blk *block;
     pthread_t input_thread;
     bool input_started;
     struct termios saved_termios;
@@ -86,6 +89,10 @@ void rackvm_serial_destroy(struct rackvm *vm);
 void rackvm_serial_start_input(struct rackvm *vm);
 void rackvm_serial_stop_input(struct rackvm *vm);
 bool rackvm_serial_io(struct rackvm_vcpu *vcpu);
+
+int rackvm_virtio_blk_init(struct rackvm *vm, char *error, size_t error_size);
+void rackvm_virtio_blk_destroy(struct rackvm *vm);
+bool rackvm_virtio_blk_mmio(struct rackvm_vcpu *vcpu);
 
 int rackvm_read_file(const char *path, uint8_t **data, size_t *size, char *error, size_t error_size);
 int rackvm_copy_file(const char *source, const char *destination, mode_t mode, char *error, size_t error_size);

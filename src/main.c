@@ -29,6 +29,7 @@ static void usage(FILE *stream)
         "Run options:\n"
         "  --kernel FILE       Linux bzImage to boot\n"
         "  --initrd FILE       Initial RAM filesystem\n"
+        "  --disk FILE         Writable virtio block image\n"
         "  --name NAME         Virtual machine name\n"
         "  --memory MIB        Guest memory, from 64 to 65536 MiB\n"
         "  --cpus COUNT        Virtual CPUs, from 1 to %u\n"
@@ -102,6 +103,9 @@ static int apply_run_options(int argc, char **argv, int start, struct rackvm_con
         } else if (!strcmp(option, "--initrd")) {
             if (set_text(config->initrd, sizeof(config->initrd), value, option) < 0)
                 return -1;
+        } else if (!strcmp(option, "--disk")) {
+            if (set_text(config->disk, sizeof(config->disk), value, option) < 0)
+                return -1;
         } else if (!strcmp(option, "--name")) {
             if (set_text(config->name, sizeof(config->name), value, option) < 0)
                 return -1;
@@ -159,6 +163,7 @@ static int command_validate(int argc, char **argv)
     printf("  vCPUs:      %u\n", config.cpus);
     printf("  Kernel:     %s\n", config.kernel);
     printf("  Initramfs:  %s\n", config.initrd[0] ? config.initrd : "None");
+    printf("  Disk:       %s\n", config.disk[0] ? config.disk : "None");
     return 0;
 }
 

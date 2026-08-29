@@ -27,18 +27,22 @@ printf '\001' | dd of="$temporary/vmlinuz" bs=1 seek=529 conv=notrunc status=non
 printf '\001' | dd of="$temporary/vmlinuz" bs=1 seek=566 conv=notrunc status=none
 printf 'payload' >> "$temporary/vmlinuz"
 printf 'initramfs' > "$temporary/initramfs"
+dd if=/dev/zero of="$temporary/disk.img" bs=1M count=1 status=none
 
 sed "s|KERNEL|$temporary/vmlinuz|; s|INITRD|$temporary/initramfs|" > "$temporary/rackvm.conf" <<'EOF'
 name = "RackVM Check"
 kernel = "KERNEL"
 initrd = "INITRD"
+disk = "DISK"
 memory = 128
 cpus = 2
 cmdline = "console=ttyS0 panic=-1"
 interactive = false
 EOF
+sed -i "s|DISK|$temporary/disk.img|" "$temporary/rackvm.conf"
 
 "$rackvm" validate "$temporary/rackvm.conf" | grep -q 'Configuration is valid.'
+"$rackvm" validate "$temporary/rackvm.conf" | grep -q "Disk:       $temporary/disk.img"
 "$rackvm" inspect "$temporary/vmlinuz" | grep -q 'Architecture:      x86-64'
 "$rackvm" verify "$temporary/rackvm.conf" | grep -q 'Guest image is bootable by RackVM.'
 sed 's/cpus = 2/cpus = 64/' "$temporary/rackvm.conf" > "$temporary/rackvm-64.conf"
@@ -52,6 +56,8 @@ printf 'kernel = "%s"\nunknown = true\n' "$temporary/vmlinuz" > "$temporary/unkn
 expect_failure "unknown key 'unknown'" "$rackvm" validate "$temporary/unknown-key.conf"
 printf 'kernel = "%s\n' "$temporary/vmlinuz" > "$temporary/unterminated.conf"
 expect_failure 'unterminated quoted value' "$rackvm" validate "$temporary/unterminated.conf"
+sed 's|disk = .*|disk = "/missing/rackvm-disk"|' "$temporary/rackvm.conf" > "$temporary/missing-disk.conf"
+expect_failure '/missing/rackvm-disk' "$rackvm" validate "$temporary/missing-disk.conf"
 
 cp "$temporary/vmlinuz" "$temporary/oversized-vmlinuz"
 printf '\012\002' | dd of="$temporary/oversized-vmlinuz" bs=1 seek=518 conv=notrunc status=none

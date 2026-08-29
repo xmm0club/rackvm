@@ -7,7 +7,7 @@ CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Ws
 LDFLAGS += -Wl,-z,relro,-z,now
 LDLIBS += -pthread
 
-SOURCES := src/main.c src/config.c src/util.c src/serial.c src/vm.c src/devirt.c
+SOURCES := src/main.c src/config.c src/util.c src/serial.c src/virtio_blk.c src/vm.c src/devirt.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 TARGET := build/rackvm
 
