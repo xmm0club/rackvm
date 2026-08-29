@@ -7,9 +7,10 @@ CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Ws
 LDFLAGS += -Wl,-z,relro,-z,now
 LDLIBS += -pthread
 
-SOURCES := src/main.c src/config.c src/util.c src/serial.c src/virtio_blk.c src/vm.c src/devirt.c
+SOURCES := src/main.c src/config.c src/util.c src/serial.c src/virtio_blk.c src/sandbox.c src/vm.c src/devirt.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 TARGET := build/rackvm
+SANDBOX_TEST := build/sandbox-test
 
 .PHONY: all clean check install uninstall demo-initramfs
 
@@ -22,8 +23,12 @@ build/%.o: src/%.c include/rackvm.h
 	@mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-check: $(TARGET)
+check: $(TARGET) $(SANDBOX_TEST)
 	./tests/check.sh ./$(TARGET)
+	./$(SANDBOX_TEST)
+
+$(SANDBOX_TEST): tests/sandbox.c build/sandbox.o include/rackvm.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/sandbox.c build/sandbox.o
 
 demo-initramfs:
 	./tools/mkinitramfs.sh examples/assets/initramfs

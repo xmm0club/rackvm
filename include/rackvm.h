@@ -110,6 +110,8 @@ int rackvm_virtio_blk_init(struct rackvm *vm, char *error, size_t error_size);
 void rackvm_virtio_blk_destroy(struct rackvm *vm);
 bool rackvm_virtio_blk_mmio(struct rackvm_vcpu *vcpu);
 
+int rackvm_vcpu_sandbox(void);
+
 int rackvm_read_file(const char *path, uint8_t **data, size_t *size, char *error, size_t error_size);
 int rackvm_copy_file(const char *source, const char *destination, mode_t mode, char *error, size_t error_size);
 int rackvm_mkdir(const char *path, mode_t mode, char *error, size_t error_size);

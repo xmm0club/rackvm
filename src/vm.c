@@ -477,6 +477,11 @@ static void *vcpu_main(void *argument)
 {
     struct rackvm_vcpu *vcpu = argument;
     struct rackvm *vm = vcpu->vm;
+    if (rackvm_vcpu_sandbox() < 0) {
+        fprintf(stderr, "RackVM: Cannot isolate vCPU %u: %s\n", vcpu->id, strerror(errno));
+        stop_vm(vm, 1);
+        return NULL;
+    }
     while (!atomic_load(&vm->stopping)) {
         if (run_vcpu(vcpu) < 0) {
             if (atomic_load(&vm->stopping))
