@@ -24,6 +24,12 @@
 #define IDENTITY_MAP_ADDRESS 0xffffc000ULL
 #define E820_RAM 1
 #define E820_RESERVED 2
+#define SNAPSHOT_MAGIC "RACKVMS1"
+#define SNAPSHOT_VERSION 1U
+#define SNAPSHOT_HAS_XSAVE (1U << 0)
+#define SNAPSHOT_HAS_XCRS (1U << 1)
+#define SNAPSHOT_HAS_EVENTS (1U << 2)
+#define SNAPSHOT_HAS_DEBUGREGS (1U << 3)
 
 struct mp_floating_pointer {
     char signature[4];
@@ -84,7 +90,65 @@ struct mp_interrupt {
     uint8_t destination_irq;
 } __attribute__((packed));
 
+struct snapshot_vcpu {
+    uint32_t optional;
+    uint32_t reserved;
+    struct kvm_regs regs;
+    struct kvm_sregs sregs;
+    struct kvm_fpu fpu;
+    struct kvm_lapic_state lapic;
+    struct kvm_mp_state mp_state;
+    struct kvm_xsave xsave;
+    struct kvm_xcrs xcrs;
+    struct kvm_vcpu_events events;
+    struct kvm_debugregs debugregs;
+};
+
+struct snapshot_header {
+    char magic[8];
+    uint32_t version;
+    uint32_t header_size;
+    uint32_t vcpu_state_size;
+    uint32_t vcpu_count;
+    uint64_t memory_size;
+    struct rackvm_config config;
+    struct rackvm_serial_state serial;
+    struct kvm_clock_data clock;
+    struct kvm_pit_state2 pit;
+    struct kvm_irqchip irqchips[3];
+};
+
 static sigset_t saved_signal_mask;
+
+static int write_exact(int fd, const void *buffer, size_t size)
+{
+    const uint8_t *current = buffer;
+    while (size) {
+        ssize_t written = write(fd, current, size);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0)
+            return -1;
+        current += (size_t)written;
+        size -= (size_t)written;
+    }
+    return 0;
+}
+
+static int read_exact(int fd, void *buffer, size_t size)
+{
+    uint8_t *current = buffer;
+    while (size) {
+        ssize_t received = read(fd, current, size);
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received <= 0)
+            return -1;
+        current += (size_t)received;
+        size -= (size_t)received;
+    }
+    return 0;
+}
 
 static uint8_t checksum(const void *data, size_t size)
 {
@@ -478,7 +542,7 @@ static void destroy_vm(struct rackvm *vm)
         close(vm->kvm_fd);
 }
 
-static int initialize_vm(struct rackvm *vm, char *error, size_t error_size)
+static int initialize_vm(struct rackvm *vm, bool load_boot, char *error, size_t error_size)
 {
     vm->kvm_fd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if (vm->kvm_fd < 0) {
@@ -568,80 +632,318 @@ static int initialize_vm(struct rackvm *vm, char *error, size_t error_size)
             return -1;
         }
     }
-    if (load_guest(vm, error, error_size) < 0)
-        return -1;
-    if (setup_boot_cpu(&vm->vcpus[0]) < 0) {
-        rackvm_set_error(error, error_size, "Cannot initialize the boot vCPU: %s", strerror(errno));
-        return -1;
+    if (load_boot) {
+        if (load_guest(vm, error, error_size) < 0)
+            return -1;
+        if (setup_boot_cpu(&vm->vcpus[0]) < 0) {
+            rackvm_set_error(error, error_size, "Cannot initialize the boot vCPU: %s", strerror(errno));
+            return -1;
+        }
     }
     return 0;
 }
 
-int rackvm_vm_run(const struct rackvm_config *config)
+static int execute_vm(struct rackvm *vm)
 {
-    struct rackvm vm;
-    memset(&vm, 0, sizeof(vm));
-    vm.config = *config;
-    vm.kvm_fd = -1;
-    vm.vm_fd = -1;
-    atomic_init(&vm.stopping, false);
-    atomic_init(&vm.exit_status, 0);
-    char error[512];
-    if (rackvm_serial_init(&vm) < 0) {
-        fprintf(stderr, "RackVM: Cannot initialize the serial console.\n");
-        return 1;
-    }
-    if (initialize_vm(&vm, error, sizeof(error)) < 0) {
-        fprintf(stderr, "RackVM: %s\n", error);
-        destroy_vm(&vm);
-        return 1;
-    }
-    if (install_signals(&vm) < 0) {
+    if (install_signals(vm) < 0) {
         fprintf(stderr, "RackVM: Cannot install signal handlers: %s\n", strerror(errno));
-        destroy_vm(&vm);
         return 1;
     }
-    printf("RackVM %s | %s | %llu MiB | %u vCPU%s\n", RACKVM_VERSION, vm.config.name, (unsigned long long)vm.config.memory_mib, vm.vcpu_count, vm.vcpu_count == 1 ? "" : "s");
+    printf("RackVM %s | %s | %llu MiB | %u vCPU%s\n", RACKVM_VERSION, vm->config.name, (unsigned long long)vm->config.memory_mib, vm->vcpu_count, vm->vcpu_count == 1 ? "" : "s");
     printf("Serial console attached. Press Ctrl+C to stop the VM.\n\n");
     fflush(stdout);
-    rackvm_serial_start_input(&vm);
-    for (unsigned int i = 0; i < vm.vcpu_count; i++) {
-        if (pthread_create(&vm.vcpus[i].thread, NULL, vcpu_main, &vm.vcpus[i]) != 0) {
+    rackvm_serial_start_input(vm);
+    for (unsigned int i = 0; i < vm->vcpu_count; i++) {
+        if (pthread_create(&vm->vcpus[i].thread, NULL, vcpu_main, &vm->vcpus[i]) != 0) {
             fprintf(stderr, "RackVM: Cannot start vCPU %u.\n", i);
-            stop_vm(&vm, 1);
+            stop_vm(vm, 1);
             break;
         }
-        vm.vcpus[i].thread_started = true;
+        vm->vcpus[i].thread_started = true;
     }
     sigset_t stop_signals;
     sigemptyset(&stop_signals);
     sigaddset(&stop_signals, SIGINT);
     sigaddset(&stop_signals, SIGTERM);
-    while (!atomic_load(&vm.stopping)) {
+    while (!atomic_load(&vm->stopping)) {
         struct timespec timeout = {.tv_sec = 0, .tv_nsec = 100000000};
         int received = sigtimedwait(&stop_signals, NULL, &timeout);
         if (received == SIGINT || received == SIGTERM) {
-            stop_vm(&vm, 0);
+            stop_vm(vm, 0);
             break;
         }
         if (received < 0 && errno != EAGAIN && errno != EINTR) {
             fprintf(stderr, "RackVM: Signal wait failed: %s\n", strerror(errno));
-            stop_vm(&vm, 1);
+            stop_vm(vm, 1);
             break;
         }
     }
-    for (unsigned int i = 0; i < vm.vcpu_count; i++) {
-        if (vm.vcpus[i].thread_started) {
-            pthread_join(vm.vcpus[i].thread, NULL);
-            vm.vcpus[i].thread_started = false;
+    for (unsigned int i = 0; i < vm->vcpu_count; i++) {
+        if (vm->vcpus[i].thread_started) {
+            pthread_join(vm->vcpus[i].thread, NULL);
+            vm->vcpus[i].thread_started = false;
         }
     }
-    stop_vm(&vm, atomic_load(&vm.exit_status));
-    rackvm_serial_stop_input(&vm);
+    stop_vm(vm, atomic_load(&vm->exit_status));
+    rackvm_serial_stop_input(vm);
     restore_signals();
-    int status = atomic_load(&vm.exit_status);
+    return atomic_load(&vm->exit_status);
+}
+
+static void initialise_vm_object(struct rackvm *vm, const struct rackvm_config *config)
+{
+    memset(vm, 0, sizeof(*vm));
+    vm->config = *config;
+    vm->kvm_fd = -1;
+    vm->vm_fd = -1;
+    atomic_init(&vm->stopping, false);
+    atomic_init(&vm->exit_status, 0);
+}
+
+int rackvm_vm_run(const struct rackvm_config *config)
+{
+    struct rackvm vm;
+    initialise_vm_object(&vm, config);
+    char error[512];
+    if (rackvm_serial_init(&vm) < 0) {
+        fprintf(stderr, "RackVM: Cannot initialize the serial console.\n");
+        return 1;
+    }
+    if (initialize_vm(&vm, true, error, sizeof(error)) < 0) {
+        fprintf(stderr, "RackVM: %s\n", error);
+        destroy_vm(&vm);
+        return 1;
+    }
+    int status = execute_vm(&vm);
     destroy_vm(&vm);
     printf("\nRackVM: VM stopped.\n");
+    return status;
+}
+
+static int capture_vcpu_state(struct rackvm *vm, struct rackvm_vcpu *vcpu, struct snapshot_vcpu *state, char *error, size_t error_size)
+{
+    memset(state, 0, sizeof(*state));
+    if (ioctl(vcpu->fd, KVM_GET_REGS, &state->regs) < 0 ||
+        ioctl(vcpu->fd, KVM_GET_SREGS, &state->sregs) < 0 ||
+        ioctl(vcpu->fd, KVM_GET_FPU, &state->fpu) < 0 ||
+        ioctl(vcpu->fd, KVM_GET_LAPIC, &state->lapic) < 0 ||
+        ioctl(vcpu->fd, KVM_GET_MP_STATE, &state->mp_state) < 0) {
+        rackvm_set_error(error, error_size, "Cannot capture vCPU %u state: %s", vcpu->id, strerror(errno));
+        return -1;
+    }
+    if (ioctl(vm->kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_XSAVE) > 0) {
+        if (ioctl(vcpu->fd, KVM_GET_XSAVE, &state->xsave) < 0)
+            goto optional_failure;
+        state->optional |= SNAPSHOT_HAS_XSAVE;
+    }
+    if (ioctl(vm->kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_XCRS) > 0) {
+        if (ioctl(vcpu->fd, KVM_GET_XCRS, &state->xcrs) < 0)
+            goto optional_failure;
+        state->optional |= SNAPSHOT_HAS_XCRS;
+    }
+    if (ioctl(vm->kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_VCPU_EVENTS) > 0) {
+        if (ioctl(vcpu->fd, KVM_GET_VCPU_EVENTS, &state->events) < 0)
+            goto optional_failure;
+        state->optional |= SNAPSHOT_HAS_EVENTS;
+    }
+    if (ioctl(vm->kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_DEBUGREGS) > 0) {
+        if (ioctl(vcpu->fd, KVM_GET_DEBUGREGS, &state->debugregs) < 0)
+            goto optional_failure;
+        state->optional |= SNAPSHOT_HAS_DEBUGREGS;
+    }
+    return 0;
+
+optional_failure:
+    rackvm_set_error(error, error_size, "Cannot capture optional vCPU %u state: %s", vcpu->id, strerror(errno));
+    return -1;
+}
+
+static int restore_vcpu_state(struct rackvm_vcpu *vcpu, const struct snapshot_vcpu *state, char *error, size_t error_size)
+{
+    if (ioctl(vcpu->fd, KVM_SET_SREGS, &state->sregs) < 0 ||
+        ioctl(vcpu->fd, KVM_SET_REGS, &state->regs) < 0 ||
+        ioctl(vcpu->fd, KVM_SET_FPU, &state->fpu) < 0 ||
+        ioctl(vcpu->fd, KVM_SET_LAPIC, &state->lapic) < 0 ||
+        ioctl(vcpu->fd, KVM_SET_MP_STATE, &state->mp_state) < 0 ||
+        ((state->optional & SNAPSHOT_HAS_XSAVE) && ioctl(vcpu->fd, KVM_SET_XSAVE, &state->xsave) < 0) ||
+        ((state->optional & SNAPSHOT_HAS_XCRS) && ioctl(vcpu->fd, KVM_SET_XCRS, &state->xcrs) < 0) ||
+        ((state->optional & SNAPSHOT_HAS_EVENTS) && ioctl(vcpu->fd, KVM_SET_VCPU_EVENTS, &state->events) < 0) ||
+        ((state->optional & SNAPSHOT_HAS_DEBUGREGS) && ioctl(vcpu->fd, KVM_SET_DEBUGREGS, &state->debugregs) < 0)) {
+        rackvm_set_error(error, error_size, "Cannot restore vCPU %u state: %s", vcpu->id, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int capture_snapshot_header(struct rackvm *vm, struct snapshot_header *header, char *error, size_t error_size)
+{
+    memset(header, 0, sizeof(*header));
+    memcpy(header->magic, SNAPSHOT_MAGIC, sizeof(header->magic));
+    header->version = SNAPSHOT_VERSION;
+    header->header_size = sizeof(*header);
+    header->vcpu_state_size = sizeof(struct snapshot_vcpu);
+    header->vcpu_count = vm->vcpu_count;
+    header->memory_size = vm->memory_size;
+    header->config = vm->config;
+    rackvm_serial_save(vm, &header->serial);
+    if (ioctl(vm->vm_fd, KVM_GET_CLOCK, &header->clock) < 0 || ioctl(vm->vm_fd, KVM_GET_PIT2, &header->pit) < 0) {
+        rackvm_set_error(error, error_size, "Cannot capture VM timer state: %s", strerror(errno));
+        return -1;
+    }
+    for (uint32_t i = 0; i < 3; i++) {
+        header->irqchips[i].chip_id = i;
+        if (ioctl(vm->vm_fd, KVM_GET_IRQCHIP, &header->irqchips[i]) < 0) {
+            rackvm_set_error(error, error_size, "Cannot capture IRQ chip %u: %s", i, strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int restore_snapshot_devices(struct rackvm *vm, const struct snapshot_header *header, char *error, size_t error_size)
+{
+    for (uint32_t i = 0; i < 3; i++) {
+        if (ioctl(vm->vm_fd, KVM_SET_IRQCHIP, &header->irqchips[i]) < 0) {
+            rackvm_set_error(error, error_size, "Cannot restore IRQ chip %u: %s", i, strerror(errno));
+            return -1;
+        }
+    }
+    if (ioctl(vm->vm_fd, KVM_SET_PIT2, &header->pit) < 0 || ioctl(vm->vm_fd, KVM_SET_CLOCK, &header->clock) < 0) {
+        rackvm_set_error(error, error_size, "Cannot restore VM timer state: %s", strerror(errno));
+        return -1;
+    }
+    rackvm_serial_restore(vm, &header->serial);
+    return 0;
+}
+
+static int valid_snapshot_header(const struct snapshot_header *header, off_t file_size)
+{
+    if (memcmp(header->magic, SNAPSHOT_MAGIC, sizeof(header->magic)) || header->version != SNAPSHOT_VERSION ||
+        header->header_size != sizeof(*header) || header->vcpu_state_size != sizeof(struct snapshot_vcpu) ||
+        header->vcpu_count < 1 || header->vcpu_count > RACKVM_MAX_VCPUS || header->config.cpus != header->vcpu_count ||
+        header->config.memory_mib < 64 || header->config.memory_mib > 65536 ||
+        header->memory_size != header->config.memory_mib * 1024ULL * 1024ULL)
+        return 0;
+    uint64_t state_bytes = (uint64_t)header->vcpu_count * sizeof(struct snapshot_vcpu);
+    uint64_t expected = sizeof(*header) + header->memory_size + state_bytes;
+    return expected <= INT64_MAX && file_size == (off_t)expected;
+}
+
+int rackvm_snapshot_create(const struct rackvm_config *config, const char *path)
+{
+    struct rackvm vm;
+    initialise_vm_object(&vm, config);
+    char error[512];
+    if (rackvm_serial_init(&vm) < 0) {
+        fprintf(stderr, "RackVM: Cannot initialize the serial console.\n");
+        return 1;
+    }
+    if (initialize_vm(&vm, true, error, sizeof(error)) < 0) {
+        fprintf(stderr, "RackVM: %s\n", error);
+        destroy_vm(&vm);
+        return 1;
+    }
+    struct snapshot_header header;
+    struct snapshot_vcpu *states = calloc(vm.vcpu_count, sizeof(*states));
+    int status = 1;
+    int output = -1;
+    if (!states) {
+        rackvm_set_error(error, sizeof(error), "Cannot allocate snapshot state");
+        goto failure;
+    }
+    if (capture_snapshot_header(&vm, &header, error, sizeof(error)) < 0)
+        goto failure;
+    for (unsigned int i = 0; i < vm.vcpu_count; i++) {
+        if (capture_vcpu_state(&vm, &vm.vcpus[i], &states[i], error, sizeof(error)) < 0)
+            goto failure;
+    }
+    output = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (output < 0) {
+        rackvm_set_error(error, sizeof(error), "%s: %s", path, strerror(errno));
+        goto failure;
+    }
+    if (write_exact(output, &header, sizeof(header)) < 0 || write_exact(output, vm.memory, vm.memory_size) < 0 ||
+        write_exact(output, states, (size_t)vm.vcpu_count * sizeof(*states)) < 0 || fsync(output) < 0) {
+        rackvm_set_error(error, sizeof(error), "%s: %s", path, strerror(errno));
+        goto failure;
+    }
+    close(output);
+    output = -1;
+    status = 0;
+    printf("Snapshot created at %s\n", path);
+    printf("  Guest RAM:  %llu MiB\n", (unsigned long long)config->memory_mib);
+    printf("  vCPU state: %u complete image%s\n", config->cpus, config->cpus == 1 ? "" : "s");
+
+failure:
+    if (output >= 0) {
+        close(output);
+        unlink(path);
+    }
+    if (status)
+        fprintf(stderr, "RackVM: %s\n", error);
+    free(states);
+    destroy_vm(&vm);
+    return status;
+}
+
+int rackvm_snapshot_resume(const char *path)
+{
+    int input = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (input < 0) {
+        fprintf(stderr, "RackVM: %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    struct stat file_status;
+    struct snapshot_header header;
+    if (fstat(input, &file_status) < 0 || !S_ISREG(file_status.st_mode) || read_exact(input, &header, sizeof(header)) < 0 || !valid_snapshot_header(&header, file_status.st_size)) {
+        fprintf(stderr, "RackVM: %s is not a valid RackVM snapshot.\n", path);
+        close(input);
+        return 1;
+    }
+
+    struct rackvm vm;
+    initialise_vm_object(&vm, &header.config);
+    char error[512];
+    if (rackvm_serial_init(&vm) < 0) {
+        fprintf(stderr, "RackVM: Cannot initialize the serial console.\n");
+        close(input);
+        return 1;
+    }
+    if (initialize_vm(&vm, false, error, sizeof(error)) < 0) {
+        fprintf(stderr, "RackVM: %s\n", error);
+        close(input);
+        destroy_vm(&vm);
+        return 1;
+    }
+    struct snapshot_vcpu *states = calloc(vm.vcpu_count, sizeof(*states));
+    int status = 1;
+    if (!states) {
+        rackvm_set_error(error, sizeof(error), "Cannot allocate snapshot state");
+        goto resume_failure;
+    }
+    if (read_exact(input, vm.memory, vm.memory_size) < 0 || read_exact(input, states, (size_t)vm.vcpu_count * sizeof(*states)) < 0) {
+        rackvm_set_error(error, sizeof(error), "%s: truncated snapshot", path);
+        goto resume_failure;
+    }
+    for (unsigned int i = 0; i < vm.vcpu_count; i++) {
+        if (restore_vcpu_state(&vm.vcpus[i], &states[i], error, sizeof(error)) < 0)
+            goto resume_failure;
+    }
+    if (restore_snapshot_devices(&vm, &header, error, sizeof(error)) < 0)
+        goto resume_failure;
+    close(input);
+    input = -1;
+    printf("Resuming snapshot %s\n", path);
+    status = execute_vm(&vm);
+    printf("\nRackVM: VM stopped.\n");
+
+resume_failure:
+    if (status && input >= 0)
+        fprintf(stderr, "RackVM: %s\n", error);
+    if (input >= 0)
+        close(input);
+    free(states);
+    destroy_vm(&vm);
     return status;
 }
 

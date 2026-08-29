@@ -18,6 +18,7 @@ expect_failure()
 
 "$rackvm" --version | grep -q '^RackVM '
 "$rackvm" --help | grep -q 'devirtualise'
+"$rackvm" --help | grep -q 'snapshot create'
 
 dd if=/dev/zero of="$temporary/vmlinuz" bs=1 count=4096 status=none
 printf '\125\252' | dd of="$temporary/vmlinuz" bs=1 seek=510 conv=notrunc status=none
@@ -58,6 +59,9 @@ printf 'kernel = "%s\n' "$temporary/vmlinuz" > "$temporary/unterminated.conf"
 expect_failure 'unterminated quoted value' "$rackvm" validate "$temporary/unterminated.conf"
 sed 's|disk = .*|disk = "/missing/rackvm-disk"|' "$temporary/rackvm.conf" > "$temporary/missing-disk.conf"
 expect_failure '/missing/rackvm-disk' "$rackvm" validate "$temporary/missing-disk.conf"
+printf 'not a snapshot' > "$temporary/corrupt.snapshot"
+expect_failure 'not a valid RackVM snapshot' "$rackvm" snapshot resume "$temporary/corrupt.snapshot"
+expect_failure 'Usage: rackvm snapshot create' "$rackvm" snapshot create
 
 cp "$temporary/vmlinuz" "$temporary/oversized-vmlinuz"
 printf '\012\002' | dd of="$temporary/oversized-vmlinuz" bs=1 seek=518 conv=notrunc status=none

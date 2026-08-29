@@ -42,6 +42,18 @@ struct rackvm_serial {
     bool irq_asserted;
 };
 
+struct rackvm_serial_state {
+    uint8_t queue[RACKVM_SERIAL_QUEUE];
+    uint64_t head;
+    uint64_t tail;
+    uint8_t ier;
+    uint8_t lcr;
+    uint8_t mcr;
+    uint8_t scratch;
+    uint16_t divisor;
+    uint8_t irq_asserted;
+};
+
 struct rackvm;
 struct rackvm_virtio_blk;
 
@@ -79,6 +91,8 @@ int rackvm_config_validate(const struct rackvm_config *config, char *error, size
 int rackvm_config_resolve_paths(struct rackvm_config *config, const char *config_path, char *error, size_t error_size);
 
 int rackvm_vm_run(const struct rackvm_config *config);
+int rackvm_snapshot_create(const struct rackvm_config *config, const char *path);
+int rackvm_snapshot_resume(const char *path);
 int rackvm_guest_verify(const struct rackvm_config *config);
 int rackvm_doctor(void);
 int rackvm_kernel_inspect(const char *path);
@@ -89,6 +103,8 @@ void rackvm_serial_destroy(struct rackvm *vm);
 void rackvm_serial_start_input(struct rackvm *vm);
 void rackvm_serial_stop_input(struct rackvm *vm);
 bool rackvm_serial_io(struct rackvm_vcpu *vcpu);
+void rackvm_serial_save(struct rackvm *vm, struct rackvm_serial_state *state);
+void rackvm_serial_restore(struct rackvm *vm, const struct rackvm_serial_state *state);
 
 int rackvm_virtio_blk_init(struct rackvm *vm, char *error, size_t error_size);
 void rackvm_virtio_blk_destroy(struct rackvm *vm);

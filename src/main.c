@@ -24,6 +24,8 @@ static void usage(FILE *stream)
         "  rackvm validate CONFIG\n"
         "  rackvm verify CONFIG\n"
         "  rackvm inspect KERNEL\n"
+        "  rackvm snapshot create CONFIG --output FILE\n"
+        "  rackvm snapshot resume FILE\n"
         "  rackvm devirtualise CONFIG --output DIRECTORY\n"
         "  rackvm doctor\n\n"
         "Run options:\n"
@@ -247,6 +249,21 @@ static int command_devirtualise(int argc, char **argv)
     return rackvm_devirtualise(&config, argv[4]);
 }
 
+static int command_snapshot(int argc, char **argv)
+{
+    if (argc == 6 && !strcmp(argv[2], "create") && !strcmp(argv[4], "--output")) {
+        struct rackvm_config config;
+        if (load_config(argv[3], &config) < 0 || validate_config(&config) < 0)
+            return 1;
+        return rackvm_snapshot_create(&config, argv[5]);
+    }
+    if (argc == 4 && !strcmp(argv[2], "resume"))
+        return rackvm_snapshot_resume(argv[3]);
+    fprintf(stderr, "RackVM: Usage: rackvm snapshot create CONFIG --output FILE\n");
+    fprintf(stderr, "               rackvm snapshot resume FILE\n");
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -284,6 +301,8 @@ int main(int argc, char **argv)
     }
     if (!strcmp(argv[1], "devirtualise"))
         return command_devirtualise(argc, argv);
+    if (!strcmp(argv[1], "snapshot"))
+        return command_snapshot(argc, argv);
     if (!strcmp(argv[1], "doctor")) {
         if (argc != 2) {
             fprintf(stderr, "RackVM: doctor does not accept arguments.\n");

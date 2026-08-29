@@ -233,3 +233,35 @@ void rackvm_serial_destroy(struct rackvm *vm)
     rackvm_serial_stop_input(vm);
     pthread_mutex_destroy(&vm->serial.lock);
 }
+
+void rackvm_serial_save(struct rackvm *vm, struct rackvm_serial_state *state)
+{
+    pthread_mutex_lock(&vm->serial.lock);
+    memset(state, 0, sizeof(*state));
+    memcpy(state->queue, vm->serial.queue, sizeof(state->queue));
+    state->head = vm->serial.head;
+    state->tail = vm->serial.tail;
+    state->ier = vm->serial.ier;
+    state->lcr = vm->serial.lcr;
+    state->mcr = vm->serial.mcr;
+    state->scratch = vm->serial.scratch;
+    state->divisor = vm->serial.divisor;
+    state->irq_asserted = vm->serial.irq_asserted ? 1 : 0;
+    pthread_mutex_unlock(&vm->serial.lock);
+}
+
+void rackvm_serial_restore(struct rackvm *vm, const struct rackvm_serial_state *state)
+{
+    pthread_mutex_lock(&vm->serial.lock);
+    memcpy(vm->serial.queue, state->queue, sizeof(vm->serial.queue));
+    vm->serial.head = (size_t)(state->head % RACKVM_SERIAL_QUEUE);
+    vm->serial.tail = (size_t)(state->tail % RACKVM_SERIAL_QUEUE);
+    vm->serial.ier = state->ier;
+    vm->serial.lcr = state->lcr;
+    vm->serial.mcr = state->mcr;
+    vm->serial.scratch = state->scratch;
+    vm->serial.divisor = state->divisor;
+    vm->serial.irq_asserted = false;
+    refresh_irq(vm);
+    pthread_mutex_unlock(&vm->serial.lock);
+}
